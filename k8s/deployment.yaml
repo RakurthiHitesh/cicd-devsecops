@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-devsecops-app
+  namespace: devsecops-app
+  labels:
+    app: flask-devsecops-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: flask-devsecops-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: flask-devsecops-app
+    spec:
+      # Security Context — run as non-root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+
+      containers:
+      - name: flask-app
+        image: yourACRname.azurecr.io/flask-devsecops-app:latest  # replaced by pipeline
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5000
+
+        env:
+        - name: ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: environment
+        - name: APP_VERSION
+          value: "1.0.0"
+
+        # Resource limits
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+
+        # Health probes
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        # Security — read-only root filesystem
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: devsecops-app
+data:
+  environment: "production"

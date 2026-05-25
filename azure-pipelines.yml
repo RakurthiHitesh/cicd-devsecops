@@ -1,0 +1,196 @@
+# ============================================================
+#  CI/CD Pipeline with DevSecOps
+#  Author: R. Hitesh Naga Pavan
+#  Stages: Build → SAST → Container Scan → Push → Deploy
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - README.md
+      - docs/*
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  # Azure Container Registry
+  ACR_NAME: 'yourACRname'
+  ACR_LOGIN_SERVER: '$(ACR_NAME).azurecr.io'
+  IMAGE_NAME: 'flask-devsecops-app'
+  IMAGE_TAG: '$(Build.BuildId)'
+  FULL_IMAGE: '$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)'
+
+  # AKS
+  AKS_RESOURCE_GROUP: 'rg-devsecops'
+  AKS_CLUSTER_NAME:   'aks-devsecops'
+  K8S_NAMESPACE:      'devsecops-app'
+
+  # SonarQube
+  SONAR_PROJECT_KEY: 'flask-devsecops-app'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+
+# ──────────────────────────────────────────────
+# STAGE 1 — Build & Unit Tests
+# ──────────────────────────────────────────────
+- stage: Build
+  displayName: 'Build & Test'
+  jobs:
+  - job: UnitTest
+    displayName: 'Run Unit Tests'
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.11'
+      displayName: 'Set Python version'
+
+    - script: |
+        pip install -r app/requirements.txt
+        pytest app/test_app.py --junitxml=test-results.xml --cov=app --cov-report=xml:coverage.xml
+      displayName: 'Run pytest with coverage'
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: 'test-results.xml'
+      displayName: 'Publish test results'
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: 'coverage.xml'
+      displayName: 'Publish coverage report'
+
+
+# ──────────────────────────────────────────────
+# STAGE 2 — SAST with SonarQube
+# ──────────────────────────────────────────────
+- stage: SAST
+  displayName: 'Static Analysis (SonarQube)'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: SonarScan
+    displayName: 'SonarQube Scan'
+    steps:
+    - task: SonarQubePrepare@5
+      inputs:
+        SonarQube: 'SonarQube-ServiceConnection'
+        scannerMode: 'CLI'
+        configMode: 'file'
+        configFile: 'sonarqube/sonar-project.properties'
+      displayName: 'Prepare SonarQube analysis'
+
+    - task: SonarQubeAnalyze@5
+      displayName: 'Run SonarQube analysis'
+
+    - task: SonarQubePublish@5
+      inputs:
+        pollingTimeoutSec: '300'
+      displayName: 'Publish SonarQube results'
+
+
+# ──────────────────────────────────────────────
+# STAGE 3 — Docker Build & Trivy Container Scan
+# ──────────────────────────────────────────────
+- stage: ContainerScan
+  displayName: 'Docker Build & Trivy Scan'
+  dependsOn: SAST
+  condition: succeeded()
+  jobs:
+  - job: BuildAndScan
+    displayName: 'Build Image & Scan'
+    steps:
+    - task: Docker@2
+      displayName: 'Build Docker image'
+      inputs:
+        command: 'build'
+        Dockerfile: 'Dockerfile'
+        tags: '$(FULL_IMAGE)'
+        buildContext: '.'
+
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        trivy image \
+          --exit-code 1 \
+          --severity HIGH,CRITICAL \
+          --no-progress \
+          --format table \
+          $(FULL_IMAGE)
+      displayName: 'Trivy vulnerability scan'
+
+    - task: Docker@2
+      displayName: 'Push image to ACR'
+      inputs:
+        command: 'push'
+        containerRegistry: 'ACR-ServiceConnection'
+        repository: '$(IMAGE_NAME)'
+        tags: '$(IMAGE_TAG)'
+
+
+# ──────────────────────────────────────────────
+# STAGE 4 — Deploy to AKS (Dev)
+# ──────────────────────────────────────────────
+- stage: DeployDev
+  displayName: 'Deploy to Dev'
+  dependsOn: ContainerScan
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  jobs:
+  - deployment: DeployToDev
+    displayName: 'Deploy to Dev AKS'
+    environment: 'dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: 'Deploy to AKS dev namespace'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'AKS-ServiceConnection'
+              namespace: '$(K8S_NAMESPACE)-dev'
+              manifests: |
+                k8s/namespace.yaml
+                k8s/deployment.yaml
+                k8s/service.yaml
+                k8s/hpa.yaml
+              containers: '$(FULL_IMAGE)'
+
+
+# ──────────────────────────────────────────────
+# STAGE 5 — Deploy to Production (main branch)
+# ──────────────────────────────────────────────
+- stage: DeployProd
+  displayName: 'Deploy to Production'
+  dependsOn: ContainerScan
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployToProd
+    displayName: 'Deploy to Prod AKS'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: 'Deploy to AKS prod namespace'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'AKS-ServiceConnection'
+              namespace: '$(K8S_NAMESPACE)'
+              manifests: |
+                k8s/namespace.yaml
+                k8s/deployment.yaml
+                k8s/service.yaml
+                k8s/hpa.yaml
+              containers: '$(FULL_IMAGE)'
